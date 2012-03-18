@@ -1,0 +1,5 @@
+hwlat_detector: A system hardware latency detector
+
+This patch introduces a new hardware latency detector module that can be used
+to detect high hardware-induced latencies within the system. It was originally
+written for use in the RT kernel, but has wider applications.
