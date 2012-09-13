@@ -1,16 +1,20 @@
 hwlat_detector: A system hardware latency detector
 
-This patch introduces a new hardware latency detector module that can be used
-to detect high hardware-induced latencies within the system. It was originally
-written for use in the RT kernel, but has wider applications.
-Original-by: Jon Masters <jcm@jonmasters.org>
+This patch allows the use of the hardware latency detector module
+on 3.0.0 kernels. This module can be used to detect high hardware-induced
+latencies within the system. It was originally written for use in
+the RT kernel, but has wider applications.
 
 Signed-off-by: Raphaël Beamonte <raphael.beamonte@gmail.com>
 
-Index: xaf/Documentation/hwlat_detector.txt
+---
+ drivers/misc/hwlat_detector.c |    4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+Index: b/Documentation/hwlat_detector.txt
 ===================================================================
 --- /dev/null
-+++ xaf/Documentation/hwlat_detector.txt
++++ b/Documentation/hwlat_detector.txt
 @@ -0,0 +1,64 @@
 +Introduction:
 +-------------
@@ -76,17 +80,18 @@ Index: xaf/Documentation/hwlat_detector.txt
 +observe any latencies that exceed the threshold (initially 100 usecs),
 +then we write to a global sample ring buffer of 8K samples, which is
 +consumed by reading from the "sample" (pipe) debugfs file interface.
-Index: xaf/drivers/misc/Kconfig
+Index: b/drivers/misc/Kconfig
 ===================================================================
---- xaf.orig/drivers/misc/Kconfig
-+++ xaf/drivers/misc/Kconfig
-@@ -76,6 +76,34 @@ config IBM_ASM
- 	  information on the specific driver level and support statement
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -124,6 +124,35 @@ config IBM_ASM
+ 	  for information on the specific driver level and support statement
  	  for your IBM server.
  
 +config HWLAT_DETECTOR
 +	tristate "Testing module to detect hardware-induced latencies"
 +	depends on DEBUG_FS
++	depends on RING_BUFFER
 +	default m
 +	---help---
 +	  A simple hardware latency detector. Use this module to detect
@@ -115,11 +120,11 @@ Index: xaf/drivers/misc/Kconfig
  config PHANTOM
  	tristate "Sensable PHANToM (PCI)"
  	depends on PCI
-Index: xaf/drivers/misc/Makefile
+Index: b/drivers/misc/Makefile
 ===================================================================
---- xaf_quilt.orig/drivers/misc/Makefile
-+++ xaf_quilt/drivers/misc/Makefile
-@@ -38,6 +38,7 @@
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -39,6 +39,7 @@ obj-$(CONFIG_C2PORT)		+= c2port/
  obj-$(CONFIG_HMC6352)		+= hmc6352.o
  obj-y				+= eeprom/
  obj-y				+= cb710/
@@ -127,11 +132,11 @@ Index: xaf/drivers/misc/Makefile
  obj-$(CONFIG_SPEAR13XX_PCIE_GADGET)	+= spear13xx_pcie_gadget.o
  obj-$(CONFIG_VMWARE_BALLOON)	+= vmw_balloon.o
  obj-$(CONFIG_ARM_CHARLCD)	+= arm-charlcd.o
-Index: xaf_quilt/drivers/misc/hwlat_detector.c
+Index: b/drivers/misc/hwlat_detector.c
 ===================================================================
 --- /dev/null
-+++ xaf/drivers/misc/hwlat_detector.c
-@@ -0,0 +1,1212 @@
++++ b/drivers/misc/hwlat_detector.c
+@@ -0,0 +1,1231 @@
 +/*
 + * hwlat_detector.c - A simple Hardware Latency detector.
 + *
@@ -164,7 +169,6 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 + *          requiring any kind of low-latency performance guarantee(s).
 + *
 + * Copyright (C) 2008-2009 Jon Masters, Red Hat, Inc. <jcm@redhat.com>
-+ * 1.1.0 edited in 2011 by Raphaël Beamonte <raphael.beamonte@gmail.com>
 + *
 + * Includes useful feedback from Clark Williams <clark@redhat.com>
 + *
@@ -184,8 +188,8 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +#include <linux/seq_file.h>
 +#include <linux/uaccess.h>
 +#include <linux/version.h>
-+#include <linux/slab.h>
 +#include <linux/delay.h>
++#include <linux/slab.h>
 +
 +#define BUF_SIZE_DEFAULT	262144UL		/* 8K*(sizeof(entry)) */
 +#define BUF_FLAGS		(RB_FL_OVERWRITE)	/* no block on full */
@@ -278,7 +282,9 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +struct sample {
 +	u64		seqnum;		/* unique sequence */
 +	u64		duration;	/* ktime delta */
++	u64		outer_duration;	/* ktime delta (outer loop) */
 +	struct timespec	timestamp;	/* wall time */
++	unsigned long	lost;
 +};
 +
 +/* keep the global state somewhere. Mostly used under stop_machine. */
@@ -327,18 +333,12 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +	if (!sample)
 +		return NULL;
 +
-+	/* ring_buffers are per-cpu but we just want any value */
-+	/* so we'll start with this cpu and try others if not */
-+	/* Steven is planning to add a generic mechanism */
 +	mutex_lock(&ring_buffer_mutex);
 +	preempt_disable();
-+	e = ring_buffer_consume(ring_buffer, smp_processor_id(), NULL, NULL);
-+	if (!e) {
-+		for_each_online_cpu(cpu) {
-+			e = ring_buffer_consume(ring_buffer, cpu, NULL, NULL);
-+			if (e)
-+				break;
-+		}
++	for_each_online_cpu(cpu) {
++		e = ring_buffer_consume(ring_buffer, cpu, NULL, &sample->lost);
++		if (e)
++			break;
 +	}
 +
 +	if (e) {
@@ -361,17 +361,31 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 + */
 +static int get_sample(void *unused)
 +{
-+	ktime_t start, t1, t2;
++	ktime_t start, t1, t2, last_t2;
 +	s64 diff, total = 0;
 +	u64 sample = 0;
++	u64 outer_sample = 0;
 +	int ret = 1;
 +
++	last_t2.tv64 = 0;
 +	start = ktime_get(); /* start timestamp */
 +
 +	do {
 +
 +		t1 = ktime_get();	/* we'll look for a discontinuity */
 +		t2 = ktime_get();
++
++		if (last_t2.tv64) {
++			diff = ktime_to_us(ktime_sub(t1, last_t2));
++			/* This shouldn't happen */
++			if (diff < 0) {
++				printk(KERN_ERR BANNER "time running backwards\n");
++				goto out;
++			}
++			if (diff > outer_sample)
++				outer_sample = diff;
++		}
++		last_t2 = t2;
 +
 +		total = ktime_to_us(ktime_sub(t2, start)); /* sample width */
 +		diff = ktime_to_us(ktime_sub(t2, t1));     /* current diff */
@@ -388,20 +402,19 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +	} while (total <= data.sample_width);
 +
 +	/* If we exceed the threshold value, we have found a hardware latency */
-+	if (sample > data.threshold) {
++	if (sample > data.threshold || outer_sample > data.threshold) {
 +		struct sample s;
 +
 +		data.count++;
 +		s.seqnum = data.count;
 +		s.duration = sample;
++		s.outer_duration = outer_sample;
 +		s.timestamp = CURRENT_TIME;
 +		__buffer_add_sample(&s);
 +
 +		/* Keep a running maximum ever recorded hardware latency */
 +		if (sample > data.max_sample)
 +			data.max_sample = sample;
-+
-+		wake_up(&data.wq); /* wake up reader(s) */
 +	}
 +
 +	ret = 0;
@@ -438,6 +451,8 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +			mutex_unlock(&data.lock);
 +			goto err_out;
 +		}
++
++		wake_up(&data.wq); /* wake up reader(s) */
 +
 +		interval = data.sample_window - data.sample_width;
 +		do_div(interval, USEC_PER_MSEC); /* modifies interval value */
@@ -745,7 +760,11 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +		if (!enabled)
 +			goto unlock;
 +		enabled = 0;
-+		stop_kthread();
++		err = stop_kthread();
++		if (err) {
++			printk(KERN_ERR BANNER "cannot stop kthread\n");
++			return -EFAULT;
++		}
 +		wake_up(&data.wq);		/* reader(s) should return */
 +	}
 +unlock:
@@ -876,10 +895,11 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +		}
 +	}
 +
-+	len = snprintf(buf, sizeof(buf), "%010lu.%010lu\t%llu\n",
-+		      sample->timestamp.tv_sec,
-+		      sample->timestamp.tv_nsec,
-+		      sample->duration);
++	len = snprintf(buf, sizeof(buf), "%010lu.%010lu\t%llu\t%llu\n",
++			sample->timestamp.tv_sec,
++			sample->timestamp.tv_nsec,
++			sample->duration,
++			sample->outer_duration);
 +
 +
 +	/* handling partial reads is more trouble than it's worth */
@@ -1332,9 +1352,13 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 + */
 +static void detector_exit(void)
 +{
++	int err;
++
 +	if (enabled) {
 +		enabled = 0;
-+		stop_kthread();
++		err = stop_kthread();
++		if (err)
++			printk(KERN_ERR BANNER "cannot stop kthread\n");
 +	}
 +
 +	free_debugfs();
@@ -1344,13 +1368,13 @@ Index: xaf_quilt/drivers/misc/hwlat_detector.c
 +
 +module_init(detector_init);
 +module_exit(detector_exit);
-Index: xaf/MAINTAINERS
+Index: b/MAINTAINERS
 ===================================================================
---- xaf.orig/MAINTAINERS
-+++ xaf/MAINTAINERS
-@@ -2457,6 +2457,15 @@ W:	http://www.kernel.org/pub/linux/kerne
- S:	Maintained
- F:	drivers/hwmon/hdaps.c
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -3183,6 +3183,15 @@ S:	Maintained
+ F:	mm/memory-failure.c
+ F:	mm/hwpoison-inject.c
  
 +HARDWARE LATENCY DETECTOR
 +P:	Jon Masters
@@ -1362,5 +1386,5 @@ Index: xaf/MAINTAINERS
 +F:	drivers/misc/hwlat_detector.c
 +
  HYPERVISOR VIRTUAL CONSOLE DRIVER
- L:	linuxppc-dev@ozlabs.org
- L:	linux-kernel@vger.kernel.org
+ L:	linuxppc-dev@lists.ozlabs.org
+ S:	Odd Fixes
